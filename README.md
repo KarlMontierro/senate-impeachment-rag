@@ -16,7 +16,9 @@ the retrieved Senate records rather than unsupported model knowledge.
 
 **Day 1 — Project Foundation + Data Acquisition: Completed**
 
-Current progress:
+**Day 2 — Database + Document Processing: In Progress**
+
+### Day 1 Progress
 
 - Project structure created
 - Git and GitHub repository configured
@@ -30,6 +32,27 @@ Current progress:
 - PDF download process verified
 - SHA-256 file hashing verified
 - First Senate PDF successfully downloaded and verified
+
+### Day 2 Progress
+
+- PostgreSQL 18 configured
+- pgvector 0.8.6 installed and enabled
+- `documents` table created
+- `pages` table created
+- Full PDF downloader implemented
+- 88/88 PDF documents downloaded
+- SHA-256 hashes calculated for downloaded documents
+- PyMuPDF configured for PDF text extraction
+- Tesseract OCR configured as a fallback for scanned PDFs
+- Page-level extraction and OCR pipeline implemented
+- `CR00261.pdf` successfully processed
+- 93 pages extracted from `CR00261.pdf`
+- 92 pages required OCR
+- Page text successfully stored in PostgreSQL
+- Full-corpus ingestion script implemented
+
+The full 88-document corpus has been downloaded locally. Full-corpus
+database ingestion and OCR quality verification are still in progress.
 
 ## Official Data Source
 
@@ -66,7 +89,25 @@ The currently discovered corpus contains:
 | **Total** | **88** | **7** |
 
 The current implementation focuses on PDF documents.
+
 Video processing is planned for a later phase.
+
+## Day 2 Corpus Snapshot
+
+| Item | Count |
+|---|---:|
+| Total manifest records | 95 |
+| PDF documents | 88 |
+| Video files | 7 |
+| PDFs downloaded | 88 |
+| PDFs processed | 1 |
+| Pages processed | 93 |
+| Pages requiring OCR | 92 |
+
+The full PDF corpus has been downloaded locally.
+
+The current PostgreSQL ingestion test has successfully processed
+`CR00261.pdf`. Full-corpus ingestion will process the remaining documents.
 
 ## Architecture
 
@@ -118,28 +159,53 @@ Answer + Page Citations
 React Frontend
 Planned Technology Stack
 Backend
+
 Python
+
 FastAPI
+
 PostgreSQL
+
 pgvector
+
 AI / RAG
+
 Ollama
+
 Qwen3 8B
+
 nomic-embed-text
+
 Embeddings
+
 Semantic retrieval
+
 Reranking
+
 Frontend
+
 React
+
 Vite
+
 Document Processing
+
 Python PDF processing libraries
-OCR
+
+PyMuPDF
+
+Tesseract OCR
+
 Page-aware text extraction
+
 Development
+
 Git
+
 GitHub
+
 VS Code
+
 Local LLM Architecture
 
 The project is designed to run locally during development.
@@ -181,7 +247,8 @@ senate-impeachment-rag/
 │   ├── inspect_source.py
 │   ├── test_published_api.py
 │   ├── discover_documents.py
-│   └── download_test.py
+│   ├── download_test.py
+│   └── download_documents.py
 │
 ├── document_processing/
 │   └── PDF extraction and OCR
@@ -190,7 +257,7 @@ senate-impeachment-rag/
 │   └── RAG evaluation
 │
 ├── scripts/
-│   └── Utility scripts
+│   └── ingest_documents.py
 │
 ├── tests/
 │   └── Automated tests
@@ -205,6 +272,10 @@ senate-impeachment-rag/
 ├── .gitignore
 ├── README.md
 └── docker-compose.yml
+
+Generated document data, downloaded PDFs, environment files, virtual
+environments, and Python cache files are excluded from Git.
+
 Document Acquisition
 
 The crawler discovers documents from the Senate published-records API.
@@ -229,6 +300,38 @@ API path:
 Download path:
 
 /hq/uploads/impeachment/prosecution/articles_of_impeachment/CR00261.pdf
+
+The downloader also:
+
+Uses streamed downloads
+Validates HTTP responses
+Checks PDF content type
+Validates the downloaded PDF file
+Calculates SHA-256 hashes
+Skips already downloaded valid files
+Stores documents according to their category
+Uses temporary .part files during downloads
+Full Corpus Download
+
+The current manifest contains 88 PDF documents.
+
+All 88 PDFs have been successfully downloaded.
+
+The downloader initially completed 86 files, with one existing file and one
+network timeout. The failed document was retried successfully without
+redownloading the existing files.
+
+Final download status:
+
+Manifest PDFs:   88
+Downloaded:      1
+Already existed: 87
+Failed:          0
+
+The final local corpus therefore contains all 88 PDF documents.
+
+Large PDF files are intentionally not committed to GitHub.
+
 Document Manifest
 
 The crawler generates:
@@ -249,6 +352,12 @@ The manifest stores document metadata including:
   "source_url": "https://senate.gov.ph/hq/impeachment/published",
   "file_url": "https://senate.gov.ph/uploads/..."
 }
+
+The current manifest contains:
+
+95 total records
+88 PDF records
+7 video records
 
 Generated document data is excluded from Git through .gitignore.
 
@@ -280,10 +389,135 @@ Example:
 CR00261.pdf
 
 SHA-256:
+
 3f38a43be1d8ae714a69ac635b02e68123cf99ed20c681a44d8fc88c15471341
 
 The hash will later be used for duplicate detection and detecting whether a
 previously downloaded document has changed.
+
+Database
+
+The project uses PostgreSQL 18 with pgvector 0.8.6.
+
+The database is currently being used to store document metadata and
+page-level extracted text.
+
+Documents
+
+The documents table contains:
+
+documents
+├── id
+├── title
+├── category
+├── document_date
+├── source_url
+├── file_path
+├── file_hash
+├── file_size
+├── status
+├── created_at
+└── updated_at
+Pages
+
+The pages table contains:
+
+pages
+├── id
+├── document_id
+├── page_number
+└── text
+
+The pages table references the corresponding document and enforces unique
+document/page combinations.
+
+Chunks
+
+The chunks table is planned for Day 3:
+
+chunks
+├── id
+├── document_id
+├── page_id
+├── chunk_index
+├── text
+└── embedding
+
+Page-level storage is important because citations need to point back to the
+specific page containing the retrieved information.
+
+Document Processing
+
+The document processing pipeline currently performs:
+
+PDF
+ │
+ ▼
+Page-by-Page Text Extraction
+ │
+ ├── Good Text
+ │      │
+ │      ▼
+ │   Store Text
+ │
+ └── Poor / Missing Text
+        │
+        ▼
+      OCR
+        │
+        ▼
+    Store OCR Text
+
+PyMuPDF is used for normal PDF text extraction.
+
+Tesseract OCR is used when the extracted text does not meet the configured
+quality threshold.
+
+The current quality check evaluates extracted text based on minimum text
+length and alphanumeric content.
+
+Initial Processing Test
+
+CR00261.pdf was used as the initial ingestion test document.
+
+Results:
+
+Pages extracted:        93
+Pages requiring OCR:    92
+Document status:         processed
+Database document ID:   1
+
+The first page contained extractable text, while the remaining pages were
+primarily scanned/image-based and required OCR.
+
+The resulting page text was successfully stored in PostgreSQL.
+
+OCR output is retained as extracted source text rather than aggressively
+rewriting or correcting OCR artifacts.
+
+Full-Corpus Ingestion
+
+The full-corpus ingestion script is:
+
+scripts/ingest_documents.py
+
+It is designed to:
+
+Read the document manifest.
+Identify PDF records.
+Locate the corresponding local PDF.
+Calculate the SHA-256 hash.
+Extract text page-by-page.
+Detect pages requiring OCR.
+Run OCR when necessary.
+Store document metadata in PostgreSQL.
+Store page-level text in PostgreSQL.
+Update the document processing status.
+
+The full 88-document ingestion has not yet been completed.
+
+The next ingestion step is to process the downloaded corpus and verify
+extraction and OCR quality across the documents.
 
 RAG Pipeline
 
@@ -320,44 +554,9 @@ Page-Level Citations
 
 The system should answer using retrieved source material.
 
-If the available records do not provide enough evidence to answer a question,
-the system should state that the records do not provide sufficient
+If the available records do not provide enough evidence to answer a
+question, the system should state that the records do not provide sufficient
 information rather than inventing an answer.
-
-Database Design
-
-The planned database contains:
-
-Documents
-documents
-├── id
-├── title
-├── category
-├── document_date
-├── source_url
-├── file_path
-├── file_hash
-├── file_size
-├── status
-├── created_at
-└── updated_at
-Pages
-pages
-├── id
-├── document_id
-├── page_number
-└── text
-Chunks
-chunks
-├── id
-├── document_id
-├── page_id
-├── chunk_index
-├── text
-└── embedding
-
-Page-level storage is important because citations need to point back to the
-specific page containing the retrieved information.
 
 Neutrality and Source Handling
 
@@ -392,71 +591,91 @@ Shell or code execution through user prompts
 Retrieved document text should be treated as data, not as instructions to the
 LLM or application.
 
+Future hosted-model integration must also avoid exposing API keys through
+the frontend.
+
 Development Roadmap
 Day 1 — Foundation + Data Acquisition
 
 Completed
 
-Project setup
-Git/GitHub
-Senate source investigation
-API discovery
-Document crawler
-Document manifest
-PDF download proof of concept
-SHA-256 verification
+ Project setup
+ Git/GitHub
+ Senate source investigation
+ API discovery
+ Document crawler
+ Document manifest
+ PDF download proof of concept
+ SHA-256 verification
 Day 2 — Database + Document Processing
 
-Next:
+In Progress
 
-Build PostgreSQL database
-Configure pgvector
-Download all 88 PDFs
-Store document metadata
-Calculate SHA-256 hashes
-Extract PDF text page-by-page
-Add OCR fallback
-Store page text
+ Build PostgreSQL database
+ Configure pgvector
+ Download all 88 PDFs
+ Store document metadata
+ Calculate SHA-256 hashes
+ Extract PDF text page-by-page
+ Add OCR fallback
+ Store page text
+ Implement full-corpus ingestion script
+ Process the complete 88-document corpus
+ Verify OCR/text extraction quality across the corpus
 Day 3 — Chunking + Embeddings
-Implement page-aware chunking
-Generate embeddings
-Store embeddings in pgvector
-Implement semantic search
-Return document, page, text, similarity, and source URL
+
+Planned
+
+ Implement page-aware chunking
+ Generate embeddings
+ Store embeddings in pgvector
+ Implement semantic search
+ Return document, page, text, similarity, and source URL
 Day 4 — RAG Pipeline
-Query embedding
-Retrieve relevant chunks
-Reranking
-Context construction
-LLM integration
-Page-level citations
-Insufficient-evidence handling
+
+Planned
+
+ Query embedding
+ Retrieve relevant chunks
+ Reranking
+ Context construction
+ LLM integration
+ Page-level citations
+ Insufficient-evidence handling
 Day 5 — React Interface
-Chat interface
-Source citations
-Document filters
-Document detail view
-Original document links
-Corpus information
+
+Planned
+
+ Chat interface
+ Source citations
+ Document filters
+ Document detail view
+ Original document links
+ Corpus information
 Day 6 — Automatic Updates + Security
-Re-check Senate API
-Detect new documents
-Detect changed documents
-Compare URLs and SHA-256 hashes
-Add rate/context limits
-Security controls
-Prompt-injection handling
+
+Planned
+
+ Re-check Senate API
+ Detect new documents
+ Detect changed documents
+ Compare URLs and SHA-256 hashes
+ Add rate/context limits
+ Security controls
+ Prompt-injection handling
 Day 7 — Evaluation
+
+Planned
 
 Create approximately 30–50 evaluation questions covering:
 
-Retrieval accuracy
-Citation accuracy
-Faithfulness
-Answer completeness
-Hallucination rate
-Latency
-Failure cases
+ Retrieval accuracy
+ Citation accuracy
+ Faithfulness
+ Answer completeness
+ Hallucination rate
+ Latency
+ Failure cases
 
 Document the results and include them in the project README.
 
@@ -478,42 +697,42 @@ Definition of Done
 The project will be considered complete when:
 
 Data Acquisition
-Senate documents can be discovered automatically
-PDFs can be downloaded
-Metadata is stored
-Duplicate documents can be detected
-Changed documents can be detected
-Page text can be extracted
-OCR is available for scanned documents
+ Senate documents can be discovered automatically
+ PDFs can be downloaded
+ Metadata is stored for the complete corpus
+ Duplicate detection can be performed using SHA-256
+ Changed documents can be detected
+ Page text can be extracted
+ OCR is available for scanned documents
 Retrieval
-Embeddings are generated
-pgvector stores embeddings
-Relevant sources are retrieved
-Retrieval results include page information
+ Embeddings are generated
+ pgvector stores embeddings
+ Relevant sources are retrieved
+ Retrieval results include page information
 RAG
-Questions can be answered using retrieved records
-Answers are grounded in retrieved sources
-Citations identify the relevant document and page
-The system can indicate insufficient evidence
+ Questions can be answered using retrieved records
+ Answers are grounded in retrieved sources
+ Citations identify the relevant document and page
+ The system can indicate insufficient evidence
 Application
-FastAPI backend is functional
-React frontend is functional
-Users can search/chat with the corpus
-Users can inspect sources
-Users can open original Senate documents
+ FastAPI backend is functional
+ React frontend is functional
+ Users can search/chat with the corpus
+ Users can inspect sources
+ Users can open original Senate documents
 Evaluation
-Retrieval is evaluated
-Citation accuracy is evaluated
-Faithfulness is evaluated
-Completeness is evaluated
-Hallucination cases are documented
-Latency is measured
+ Retrieval is evaluated
+ Citation accuracy is evaluated
+ Faithfulness is evaluated
+ Completeness is evaluated
+ Hallucination cases are documented
+ Latency is measured
 Project Quality
-Environment variables are documented
-LLM providers are replaceable
-GitHub repository is clean
-README documents setup and architecture
-Local development works from a fresh environment
+ Environment variables are documented
+ LLM providers are replaceable
+ GitHub repository is clean
+ README documents setup and architecture
+ Local development works from a fresh environment
 Portfolio Description
 
 Developed a continuously updated retrieval-augmented generation system for
