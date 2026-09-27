@@ -1,5 +1,4 @@
 import hashlib
-import json
 import os
 from pathlib import Path
 
@@ -15,7 +14,6 @@ from PIL import Image
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MANIFEST_PATH = PROJECT_ROOT / "data" / "document_manifest.json"
 DATA_DIR = PROJECT_ROOT / "data" / "documents"
 
 load_dotenv(PROJECT_ROOT / ".env")
@@ -24,6 +22,24 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set in .env")
+
+
+# ============================================================
+# Failed documents
+# ============================================================
+
+FAILED_DOCUMENTS = [
+    {
+        "filename": "06. ANNEXES KKKKKKKK to DDDDDDDDD_edited.pdf",
+        "category": "Prosecution",
+        "category_slug": "prosecution",
+    },
+    {
+        "filename": "Annex 1 - Petition for Certiorari and Prohibition dtd March 30, 2026.pdf",
+        "category": "Defense",
+        "category_slug": "defense",
+    },
+]
 
 
 # ============================================================
@@ -50,9 +66,7 @@ def safe_relative_path(file_path: Path) -> str:
 
 def sanitize_text(text: str) -> str:
     """
-    Remove characters that PostgreSQL TEXT fields cannot store.
-
-    PostgreSQL does not allow NUL bytes (0x00) inside TEXT values.
+    Remove NUL bytes that PostgreSQL TEXT fields cannot store.
     """
 
     if not text:
@@ -65,20 +79,10 @@ def sanitize_text(text: str) -> str:
 # Text extraction
 # ============================================================
 
-def extract_page_text(page) -> str:
-    """Extract selectable text from a PDF page."""
-
-    text = page.get_text("text")
-
-    return sanitize_text(text.strip())
-
-
 def text_quality_is_good(text: str) -> bool:
     """
     Determine whether normal PDF extraction produced
     enough usable text.
-
-    Poor or nearly empty pages are sent to OCR.
     """
 
     cleaned = " ".join(text.split())
@@ -95,6 +99,14 @@ def text_quality_is_good(text: str) -> bool:
         return False
 
     return True
+
+
+def extract_page_text(page) -> str:
+    """Extract selectable text from a PDF page."""
+
+    text = page.get_text("text")
+
+    return sanitize_text(text.strip())
 
 
 def ocr_page(page) -> str:
@@ -130,7 +142,7 @@ def extract_pages(file_path: Path):
     Extract every page from a PDF.
 
     Normal text extraction is attempted first.
-    OCR is used only for pages with poor extracted text.
+    OCR is used only when extracted text is poor.
     """
 
     document = pymupdf.open(file_path)
@@ -139,6 +151,7 @@ def extract_pages(file_path: Path):
     ocr_count = 0
 
     try:
+
         total_pages = len(document)
 
         for page_number, page in enumerate(
@@ -157,10 +170,12 @@ def extract_pages(file_path: Path):
                 used_ocr = True
                 ocr_count += 1
 
+            text = sanitize_text(text)
+
             pages.append(
                 {
                     "page_number": page_number,
-                    "text": sanitize_text(text),
+                    "text": text,
                     "used_ocr": used_ocr,
                 }
             )
@@ -187,6 +202,36 @@ def extract_pages(file_path: Path):
 # Database
 # ============================================================
 
+def find_document(
+    conn,
+    filename,
+):
+    """
+    Find an existing document using its title.
+
+    The two failed documents may already have records
+    in the documents table from the previous ingestion run.
+    """
+
+    with conn.cursor() as cur:
+
+        cur.execute(
+            """
+            SELECT
+                id,
+                source_url,
+                status
+            FROM documents
+            WHERE title = %s
+            ORDER BY id
+            LIMIT 1
+            """,
+            (filename,),
+        )
+
+        return cur.fetchone()
+
+
 def upsert_document(
     conn,
     metadata,
@@ -194,9 +239,42 @@ def upsert_document(
     file_hash,
     file_size,
 ):
-    """Insert or update a document record."""
+    """Insert or update the document record."""
+
+    existing = find_document(
+        conn,
+        metadata["filename"],
+    )
 
     with conn.cursor() as cur:
+
+        if existing:
+
+            document_id = existing[0]
+
+            cur.execute(
+                """
+                UPDATE documents
+                SET
+                    category = %s,
+                    file_path = %s,
+                    file_hash = %s,
+                    file_size = %s,
+                    status = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (
+                    metadata["category"],
+                    safe_relative_path(file_path),
+                    file_hash,
+                    file_size,
+                    "processing",
+                    document_id,
+                ),
+            )
+
+            return document_id
 
         cur.execute(
             """
@@ -222,25 +300,13 @@ def upsert_document(
                 %s,
                 CURRENT_TIMESTAMP
             )
-
-            ON CONFLICT (source_url)
-            DO UPDATE SET
-                title = EXCLUDED.title,
-                category = EXCLUDED.category,
-                document_date = EXCLUDED.document_date,
-                file_path = EXCLUDED.file_path,
-                file_hash = EXCLUDED.file_hash,
-                file_size = EXCLUDED.file_size,
-                status = EXCLUDED.status,
-                updated_at = CURRENT_TIMESTAMP
-
             RETURNING id
             """,
             (
-                metadata.get("filename"),
-                metadata.get("category"),
+                metadata["filename"],
+                metadata["category"],
                 None,
-                metadata.get("file_url"),
+                f"retry://{metadata['filename']}",
                 safe_relative_path(file_path),
                 file_hash,
                 file_size,
@@ -251,16 +317,42 @@ def upsert_document(
         return cur.fetchone()[0]
 
 
+def delete_existing_pages(
+    conn,
+    document_id,
+):
+    """
+    Remove any partially inserted pages from the previous
+    failed ingestion attempt.
+
+    This ensures the retry starts with a clean page set.
+    """
+
+    with conn.cursor() as cur:
+
+        cur.execute(
+            """
+            DELETE FROM pages
+            WHERE document_id = %s
+            """,
+            (document_id,),
+        )
+
+
 def insert_pages(
     conn,
     document_id,
     pages,
 ):
-    """Insert or update page-level text."""
+    """Insert page-level text."""
 
     with conn.cursor() as cur:
 
         for page in pages:
+
+            clean_text = sanitize_text(
+                page["text"]
+            )
 
             cur.execute(
                 """
@@ -274,19 +366,11 @@ def insert_pages(
                     %s,
                     %s
                 )
-
-                ON CONFLICT (
-                    document_id,
-                    page_number
-                )
-
-                DO UPDATE SET
-                    text = EXCLUDED.text
                 """,
                 (
                     document_id,
                     page["page_number"],
-                    sanitize_text(page["text"]),
+                    clean_text,
                 ),
             )
 
@@ -316,14 +400,14 @@ def update_document_status(
 
 
 # ============================================================
-# Process one document
+# Process one failed document
 # ============================================================
 
 def process_document(
     conn,
     metadata,
 ):
-    """Process one locally available PDF."""
+    """Retry processing one failed PDF."""
 
     filename = metadata["filename"]
     category_slug = metadata["category_slug"]
@@ -335,10 +419,11 @@ def process_document(
     )
 
     print()
-    print("-" * 70)
+    print("=" * 70)
     print(f"Document: {filename}")
     print(f"Category: {metadata['category']}")
     print(f"Path:     {file_path}")
+    print("=" * 70)
 
     if not file_path.exists():
 
@@ -389,6 +474,19 @@ def process_document(
             file_size,
         )
 
+        print(
+            f"Database ID: {document_id}"
+        )
+
+        print("Removing any previous partial pages...")
+
+        delete_existing_pages(
+            conn,
+            document_id,
+        )
+
+        print("Inserting page text...")
+
         insert_pages(
             conn,
             document_id,
@@ -403,10 +501,8 @@ def process_document(
 
         conn.commit()
 
-        print(
-            f"STATUS:   PROCESSED "
-            f"(database ID {document_id})"
-        )
+        print()
+        print("STATUS: PROCESSED")
 
         return {
             "status": "processed",
@@ -420,12 +516,10 @@ def process_document(
 
         conn.rollback()
 
+        print()
+        print("STATUS: FAILED")
         print(
-            "STATUS:   FAILED"
-        )
-
-        print(
-            f"ERROR:    {error}"
+            f"ERROR: {error}"
         )
 
         return {
@@ -442,37 +536,25 @@ def process_document(
 def main():
 
     print("=" * 70)
-    print("Senate Impeachment RAG - Day 2 Document Ingestion")
+    print("Senate Impeachment RAG - Retry Failed Documents")
     print("=" * 70)
 
-    # --------------------------------------------------------
-    # Load manifest
-    # --------------------------------------------------------
+    print()
+    print("Documents to retry:")
+    
+    for document in FAILED_DOCUMENTS:
+        print(
+            f"  - {document['filename']}"
+        )
 
-    print("\nLoading manifest...")
-
-    with MANIFEST_PATH.open(
-        "r",
-        encoding="utf-8",
-    ) as f:
-
-        manifest = json.load(f)
-
-    documents = [
-        document
-        for document in manifest["documents"]
-        if document.get("file_type") == "pdf"
-    ]
-
+    print()
     print(
-        f"PDF records in manifest: {len(documents)}"
+        f"Total documents to retry: "
+        f"{len(FAILED_DOCUMENTS)}"
     )
 
-    # --------------------------------------------------------
-    # Database connection
-    # --------------------------------------------------------
-
-    print("\nConnecting to PostgreSQL...")
+    print()
+    print("Connecting to PostgreSQL...")
 
     results = []
 
@@ -480,18 +562,14 @@ def main():
         DATABASE_URL
     ) as conn:
 
-        # ----------------------------------------------------
-        # Process every PDF
-        # ----------------------------------------------------
-
         for index, metadata in enumerate(
-            documents,
+            FAILED_DOCUMENTS,
             start=1,
         ):
 
             print()
             print(
-                f"[{index}/{len(documents)}]"
+                f"[{index}/{len(FAILED_DOCUMENTS)}]"
             )
 
             result = process_document(
@@ -522,44 +600,31 @@ def main():
 
     print()
     print("=" * 70)
-    print("DAY 2 INGESTION SUMMARY")
+    print("RETRY SUMMARY")
     print("=" * 70)
 
     print(
-        f"Manifest PDFs: {len(documents)}"
+        f"Documents retried: {len(FAILED_DOCUMENTS)}"
     )
 
     print(
-        f"Processed:     {processed}"
+        f"Processed:         {processed}"
     )
 
     print(
-        f"Missing:       {missing}"
+        f"Missing:           {missing}"
     )
 
     print(
-        f"Failed:        {failed}"
+        f"Failed:            {failed}"
     )
 
     print("=" * 70)
-
-    if missing:
-
-        print()
-        print("Missing local PDFs:")
-
-        for result in results:
-
-            if result["status"] == "missing":
-
-                print(
-                    f"  - {result['filename']}"
-                )
 
     if failed:
 
         print()
-        print("Failed PDFs:")
+        print("Still failed:")
 
         for result in results:
 
